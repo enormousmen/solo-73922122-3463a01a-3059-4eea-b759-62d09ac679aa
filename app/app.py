@@ -7,8 +7,12 @@
 - 后台线程把缺块从备份回填到本地(INSERT OR IGNORE:业务写入永远优先,
   迟到的备份数据不会覆盖已提交的业务整块写入);
 - 网页可按块挂起/放行后台备份读取;挂起期间同一块的整块写入照常提交;
-- 进程重启后保留已落盘的块,并自动继续回填;
-- 只要还有缺块就拒绝断开备份;补齐后允许断开,断开后数据盘纯本地读写。
+- 值班员可按起止块号清零范围:范围内本地块被删除(释放空间供后续写入复用)、
+  缺块一并标记;清零范围以紧凑区间(自动合并)持久化,新读返回全零,
+  后台回填跳过清零块,在途回填数据也不写回;清零与业务整块写入重叠时,
+  以最后提交的操作为准;清零块计入恢复进度(每块只算一次);
+- 进程重启后保留已落盘的块与清零标记,并自动继续回填;
+- 只要还有缺块就拒绝断开备份;补齐(含清零)后允许断开,断开后数据盘纯本地读写。
 """
 from __future__ import annotations
 
@@ -35,6 +39,11 @@ CREATE TABLE IF NOT EXISTS blocks(
 CREATE TABLE IF NOT EXISTS suspended(
   idx          INTEGER PRIMARY KEY,
   suspended_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS zero_ranges(
+  start INTEGER NOT NULL,        -- 闭区间 [start, end]:已清零块
+  end   INTEGER NOT NULL,
+  PRIMARY KEY(start, end)
 );
 CREATE TABLE IF NOT EXISTS meta(
   key   TEXT PRIMARY KEY,
@@ -64,7 +73,10 @@ class Volume:
         self._worker = None
         self._stop = threading.Event()
         self.generation = 0  # reset/stop 时 +1,旧 worker 发现世代变更即退出
-        self.stats = {"backup_reads": 0, "backfilled": 0, "business_writes": 0, "late_ignored": 0}
+        self.stats = {
+            "backup_reads": 0, "backfilled": 0, "business_writes": 0,
+            "late_ignored": 0, "zeroed_blocks": 0, "zero_dropped": 0,
+        }
 
     # ---------- 元数据 ----------
     def meta_get(self, key, default="0"):
@@ -115,30 +127,100 @@ class Volume:
         with self.lock:
             return [r[0] for r in self.db.execute("SELECT idx FROM suspended ORDER BY idx")]
 
+    # ---------- 清零(范围) ----------
+    def is_zeroed_locked(self, idx):
+        return self.db.execute(
+            "SELECT 1 FROM zero_ranges WHERE start<=? AND end>=?", (idx, idx)
+        ).fetchone() is not None
+
+    def zeroed_count_locked(self):
+        (n,) = self.db.execute(
+            "SELECT COALESCE(SUM(end-start+1), 0) FROM zero_ranges"
+        ).fetchone()
+        return n
+
+    def zero_ranges_locked(self):
+        return [list(r) for r in
+                self.db.execute("SELECT start, end FROM zero_ranges ORDER BY start")]
+
+    def _merge_zero_range_locked(self, start, end):
+        """把 [start, end] 并入清零区间表:与重叠/相邻区间合并,保持紧凑存储。"""
+        rows = self.db.execute(
+            "SELECT start, end FROM zero_ranges WHERE start<=? AND end>=?",
+            (end + 1, start - 1),
+        ).fetchall()
+        ns, ne = start, end
+        for s, e in rows:
+            ns, ne = min(ns, s), max(ne, e)
+        self.db.execute(
+            "DELETE FROM zero_ranges WHERE start<=? AND end>=?", (end + 1, start - 1)
+        )
+        self.db.execute("INSERT INTO zero_ranges(start, end) VALUES (?, ?)", (ns, ne))
+
+    def _unzero_locked(self, idx):
+        """把单个块移出清零区间(区间收缩或分裂);业务写入覆盖清零块时用。"""
+        row = self.db.execute(
+            "SELECT start, end FROM zero_ranges WHERE start<=? AND end>=?", (idx, idx)
+        ).fetchone()
+        if row is None:
+            return
+        s, e = row
+        self.db.execute("DELETE FROM zero_ranges WHERE start=? AND end=?", (s, e))
+        if s <= idx - 1:
+            self.db.execute("INSERT INTO zero_ranges(start, end) VALUES (?, ?)", (s, idx - 1))
+        if idx + 1 <= e:
+            self.db.execute("INSERT INTO zero_ranges(start, end) VALUES (?, ?)", (idx + 1, e))
+
+    def zero_range(self, start, end):
+        """清零 [start, end]:删除范围内本地块(释放本地空间供后续写入复用)、
+        清除范围内挂起、并入紧凑清零区间。整个操作是一个事务:
+        任一步失败整体回滚,数据与恢复进度维持原状。"""
+        if not (0 <= start <= end < self.block_count):
+            raise ValueError(f"清零范围非法: [{start}, {end}]")
+        with self.lock:
+            try:
+                self.db.execute(
+                    "DELETE FROM blocks WHERE idx BETWEEN ? AND ?", (start, end))
+                self.db.execute(
+                    "DELETE FROM suspended WHERE idx BETWEEN ? AND ?", (start, end))
+                self._merge_zero_range_locked(start, end)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            self.stats["zeroed_blocks"] += end - start + 1
+
     # ---------- 块状态 ----------
     def present_map(self):
         with self.lock:
             return {r[0]: r[1] for r in self.db.execute("SELECT idx, source FROM blocks")}
 
     def missing_count_locked(self):
+        """缺块 = 总块数 - 本地已落盘 - 已清零(清零块计入恢复进度,每块只算一次)。"""
         (present,) = self.db.execute("SELECT COUNT(*) FROM blocks").fetchone()
-        return self.block_count - present
+        return self.block_count - present - self.zeroed_count_locked()
 
     def next_missing_unsuspended_locked(self):
         present = {r[0] for r in self.db.execute("SELECT idx FROM blocks")}
         susp = {r[0] for r in self.db.execute("SELECT idx FROM suspended")}
+        zeroed = set()
+        for s, e in self.db.execute("SELECT start, end FROM zero_ranges"):
+            zeroed.update(range(s, e + 1))
         for i in range(self.block_count):
-            if i not in present and i not in susp:
+            if i not in present and i not in susp and i not in zeroed:
                 return i
         return None
 
     # ---------- 业务读写 ----------
     def read_block(self, idx):
-        """返回 (status, data, origin)。status: local|backup|suspended|gone"""
+        """返回 (status, data, origin)。status: local|zero|backup|suspended|gone"""
         with self.lock:
             row = self.db.execute("SELECT data, source FROM blocks WHERE idx=?", (idx,)).fetchone()
             if row:
                 return "local", row[0], row[1]
+            if self.is_zeroed_locked(idx):
+                # 已清零:新发起的读返回全零,不读备份
+                return "zero", bytes(self.block_size), None
             if self.meta_get("backup_disconnected") == "1":
                 return "gone", None, None
             if self.is_suspended_locked(idx):
@@ -147,9 +229,11 @@ class Volume:
         return "backup", self.read_backup(idx), None
 
     def write_block(self, idx, data):
-        """整块写入(必须恰好 block_size 字节),业务写入永远生效。"""
+        """整块写入(必须恰好 block_size 字节),业务写入永远生效。
+        与清零重叠时以最后提交的操作为准:写入把该块移出清零区间。"""
         assert len(data) == self.block_size
         with self.lock:
+            self._unzero_locked(idx)
             self.db.execute(
                 "INSERT INTO blocks(idx,data,source,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(idx) DO UPDATE SET data=excluded.data, "
@@ -200,6 +284,10 @@ class Volume:
                 if self.is_suspended_locked(idx):
                     # 取数后被挂起:丢弃本次备份数据,等放行后再取
                     self.stats["late_ignored"] += 1
+                    continue
+                if self.is_zeroed_locked(idx):
+                    # 取数后该块被清零:在途备份数据不得写回,直接丢弃
+                    self.stats["zero_dropped"] += 1
                     continue
                 cur = self.db.execute(
                     "INSERT OR IGNORE INTO blocks(idx,data,source,updated_at) VALUES(?,?,?,?)",
@@ -263,7 +351,7 @@ class Volume:
             self._stop.clear()
 
     def reset(self):
-        """清空本地卷(演示用):已落盘块、挂起表、断开标记全部复位。"""
+        """清空本地卷(演示用):已落盘块、挂起表、清零标记、断开标记全部复位。"""
         with self.lock:
             self.generation += 1
             self._stop.set()
@@ -272,6 +360,7 @@ class Volume:
         with self.lock:
             self.db.execute("DELETE FROM blocks")
             self.db.execute("DELETE FROM suspended")
+            self.db.execute("DELETE FROM zero_ranges")
             self.meta_set("backup_disconnected", "0")
             self.db.commit()
             for k in self.stats:
@@ -297,14 +386,18 @@ class Volume:
     def status(self):
         with self.lock:
             (present,) = self.db.execute("SELECT COUNT(*) FROM blocks").fetchone()
+            zeroed = self.zeroed_count_locked()
+            recovered = present + zeroed  # 清零块计入恢复进度,与本地块互斥,每块只算一次
             return {
                 "block_size": self.block_size,
                 "block_count": self.block_count,
                 "present": present,
-                "missing": self.block_count - present,
-                "progress": round(present * 100.0 / self.block_count, 1),
+                "zeroed": zeroed,
+                "zero_ranges": self.zero_ranges_locked(),
+                "missing": self.block_count - recovered,
+                "progress": round(recovered * 100.0 / self.block_count, 1),
                 "backfill_running": self.meta_get("backfill_running") == "1",
-                "backfill_complete": present == self.block_count,
+                "backfill_complete": recovered == self.block_count,
                 "backup_disconnected": self.meta_get("backup_disconnected") == "1",
                 "suspended": self.suspended_list(),
                 "stats": dict(self.stats),
@@ -369,7 +462,9 @@ def create_app(config=None):
 
     @app.get("/api/blocks")
     def api_blocks():
-        return jsonify(present=vol.present_map(), suspended=vol.suspended_list())
+        with vol.lock:
+            return jsonify(present=vol.present_map(), suspended=vol.suspended_list(),
+                           zero_ranges=vol.zero_ranges_locked())
 
     # ---------- 块读写 ----------
     @app.get("/api/block/<int:idx>")
@@ -380,6 +475,8 @@ def create_app(config=None):
         if status == "local":
             return jsonify(ok=True, idx=idx, source="local", origin=origin,
                            text=_preview_text(data), size=len(data))
+        if status == "zero":
+            return jsonify(ok=True, idx=idx, source="zero", text="", size=len(data))
         if status == "backup":
             return jsonify(ok=True, idx=idx, source="backup",
                            text=_preview_text(data), size=len(data))
@@ -415,6 +512,27 @@ def create_app(config=None):
             return err("块号越界", 404)
         vol.resume(idx)
         return jsonify(ok=True, message=f"块 {idx} 的后台备份读取已放行")
+
+    # ---------- 清零 ----------
+    @app.post("/api/zero")
+    def api_zero():
+        body = request.get_json(silent=True) or {}
+        try:
+            start = int(body.get("start"))
+            end = int(body.get("end"))
+        except (TypeError, ValueError):
+            return err("start/end 必须为整数", 400)
+        if not (0 <= start <= end < vol.block_count):
+            return err(f"清零范围非法: 需 0 <= start <= end <= {vol.block_count - 1}", 400)
+        try:
+            vol.zero_range(start, end)
+        except Exception:
+            log.exception("清零失败,已回滚")
+            return err("清零失败,已整体回滚,数据与恢复进度维持原状", 500)
+        return jsonify(
+            ok=True,
+            message=f"块 [{start}, {end}] 已清零:本地空间已释放,新读返回全零,后台回填将跳过",
+        )
 
     # ---------- 回填 / 断开 / 重置 ----------
     @app.post("/api/backfill/start")

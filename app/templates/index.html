@@ -41,6 +41,7 @@
   .cell.backfill { background: #7bc47f; }
   .cell.business { background: #64b5f6; }
   .cell.susp { background: #ffd54f; }
+  .cell.zero { background: #b39ddb; }
   .cell.sel { border-color: #d32f2f; }
   .panel { background: #fff; border-radius: 8px; padding: 14px; flex: 1 1 320px;
            box-shadow: 0 1px 3px rgba(0,0,0,.08); }
@@ -50,6 +51,8 @@
   #sel-info b { font-size: 16px; }
   textarea { width: 100%; height: 64px; border: 1px solid #c4ccd9; border-radius: 6px;
              padding: 6px; font-size: 13px; resize: vertical; }
+  input.num { width: 84px; border: 1px solid #c4ccd9; border-radius: 6px;
+              padding: 7px 8px; font-size: 14px; }
   pre { background: #101826; color: #c8e6c9; border-radius: 6px; padding: 10px;
         font-size: 12px; line-height: 1.6; overflow: auto; max-height: 300px; white-space: pre-wrap; }
   .demo { background: #fff; border-radius: 8px; padding: 14px; margin-top: 18px;
@@ -67,6 +70,7 @@
 <main>
   <div class="cards">
     <div class="card"><div class="num" id="c-present">-</div><div class="lbl">已落盘块</div></div>
+    <div class="card"><div class="num" id="c-zeroed">-</div><div class="lbl">已清零块</div></div>
     <div class="card"><div class="num" id="c-missing">-</div><div class="lbl">缺失块</div></div>
     <div class="card"><div class="num" id="c-progress">-</div><div class="lbl">恢复进度</div></div>
     <div class="card"><div class="num" id="c-backfill">-</div><div class="lbl">回填状态</div></div>
@@ -74,6 +78,7 @@
     <div class="card"><div class="num" id="c-breads">-</div><div class="lbl">备份读取次数</div></div>
     <div class="card"><div class="num" id="c-bwrites">-</div><div class="lbl">业务写入次数</div></div>
     <div class="card"><div class="num" id="c-late">-</div><div class="lbl">迟到数据丢弃</div></div>
+    <div class="card"><div class="num" id="c-zdrop">-</div><div class="lbl">清零丢弃在途</div></div>
   </div>
   <div class="bar"><div id="bar-fill"></div></div>
 
@@ -90,6 +95,7 @@
         <span><i style="background:#d8dce3"></i>缺失</span>
         <span><i style="background:#7bc47f"></i>本地(回填)</span>
         <span><i style="background:#64b5f6"></i>本地(业务写入)</span>
+        <span><i style="background:#b39ddb"></i>已清零</span>
         <span><i style="background:#ffd54f"></i>已挂起备份读</span>
         <span>点击块进行选择</span>
       </div>
@@ -107,16 +113,30 @@
       <div class="row" style="margin-top:8px">
         <button id="btn-write">整块写入</button>
       </div>
-      <pre id="blkresult">(读取/写入结果显示在这里)</pre>
+      <h2 style="margin-top:14px">范围清零</h2>
+      <div class="row">
+        <input id="zstart" class="num" type="number" min="0" placeholder="起始块">
+        <span style="align-self:center">~</span>
+        <input id="zend" class="num" type="number" min="0" placeholder="结束块">
+        <button id="btn-zero" class="warn">清零范围</button>
+      </div>
+      <div style="font-size:12px;color:#68758a;margin-bottom:10px">
+        范围内本地块与缺块一起清零:释放本地空间,新读返回全零,回填跳过;计入恢复进度。
+      </div>
+      <pre id="blkresult">(读取/写入/清零结果显示在这里)</pre>
     </div>
   </div>
 
   <div class="demo">
     <h2>演示脚本</h2>
-    <p>一键演示:重置卷 → 挂起块 7 → 启动回填 → 挂起期间读块 7 被拒 / 整块写入成功 →
+    <p>演示一(回填与挂起):重置卷 → 挂起块 7 → 启动回填 → 挂起期间读块 7 被拒 / 整块写入成功 →
        缺块时断开备份被拒 → 放行块 7 → 等待补齐 → 块 7 仍是业务数据(迟到备份数据未覆盖)→
        断开备份 → 断开后读写正常。</p>
-    <button id="btn-demo">▶ 运行演示</button>
+    <p>演示二(清零):重置卷 → 启动回填 → 清零尾部 8 块(本地块与缺块一起清零,释放空间)→
+       读清零块返回全零 → 清零后重写其中一块(以最后提交的操作为准)→ 等待回填完成
+       (清零块计入进度、后台跳过、在途不写回)→ 断开备份 → 断开后清零块仍全零、重写块可读。</p>
+    <button id="btn-demo">▶ 运行演示一</button>
+    <button id="btn-demo-zero" class="warn">▶ 运行演示二(清零)</button>
     <button id="btn-clearlog" class="ghost">清空日志</button>
     <pre id="demolog">(演示日志)</pre>
   </div>
@@ -124,7 +144,8 @@
 <script>
 const $ = s => document.querySelector(s);
 let selected = null;
-let lastStates = { present: {}, suspended: [] };
+let lastStates = { present: {}, suspended: [], zero_ranges: [] };
+let zeroedSet = new Set();
 let blockCount = 256;
 
 async function api(path, method = "GET", body) {
@@ -143,8 +164,12 @@ async function refresh() {
   const st = await api("/api/status");
   const bl = await api("/api/blocks");
   lastStates = bl;
+  zeroedSet = new Set();
+  for (const [s, e] of (bl.zero_ranges || []))
+    for (let i = s; i <= e; i++) zeroedSet.add(i);
   blockCount = st.block_count;
   $("#c-present").textContent = st.present + " / " + st.block_count;
+  $("#c-zeroed").textContent = st.zeroed;
   $("#c-missing").textContent = st.missing;
   $("#c-progress").textContent = st.progress + "%";
   $("#c-backfill").textContent = st.backfill_complete ? "已完成" : (st.backfill_running ? "回填中" : "未运行");
@@ -152,6 +177,7 @@ async function refresh() {
   $("#c-breads").textContent = st.stats.backup_reads;
   $("#c-bwrites").textContent = st.stats.business_writes;
   $("#c-late").textContent = st.stats.late_ignored;
+  $("#c-zdrop").textContent = st.stats.zero_dropped;
   $("#bar-fill").style.width = st.progress + "%";
   renderGrid();
   renderSelInfo();
@@ -163,6 +189,7 @@ function cellClass(i) {
   const src = lastStates.present[i];
   if (src === "backfill") return "cell backfill";
   if (src === "business") return "cell business";
+  if (zeroedSet.has(i)) return "cell zero";
   return "cell";
 }
 
@@ -188,6 +215,7 @@ function blockStateText(i) {
   const src = lastStates.present[i];
   if (src === "backfill") parts.push('本地(来源:回填)');
   else if (src === "business") parts.push('本地(来源:业务写入)');
+  else if (zeroedSet.has(i)) parts.push("已清零(读全零)");
   else parts.push("缺失");
   if (lastStates.suspended.includes(i)) parts.push("已挂起备份读");
   return parts.join(" · ");
@@ -215,8 +243,15 @@ $("#btn-read").onclick = async () => {
   if (selected === null) return;
   const j = await api("/api/block/" + selected);
   $("#blkresult").textContent = j._status === 200
-    ? `块 ${j.idx} 来源=${j.source}${j.origin ? "/" + j.origin : ""} 大小=${j.size}B\n内容预览: ${j.text}`
+    ? `块 ${j.idx} 来源=${j.source}${j.origin ? "/" + j.origin : ""} 大小=${j.size}B\n内容预览: ${j.source === "zero" ? "(全零块 " + j.size + " 字节)" : j.text}`
     : `HTTP ${j._status}: ${j.message}`;
+};
+$("#btn-zero").onclick = async () => {
+  const s = $("#zstart").value, e = $("#zend").value;
+  if (s === "" || e === "") { $("#blkresult").textContent = "请输入起止块号"; return; }
+  const j = await api("/api/zero", "POST", { start: Number(s), end: Number(e) });
+  $("#blkresult").textContent = `HTTP ${j._status}: ${j.message}`;
+  refresh();
 };
 $("#btn-write").onclick = async () => {
   if (selected === null) return;
@@ -256,7 +291,7 @@ $("#btn-demo").onclick = async () => {
   btn.disabled = true;
   const B = 7;
   try {
-    slog("=== 演示开始 ===");
+    slog("=== 演示一(回填与挂起)开始 ===");
     let j = await api("/api/reset", "POST");
     slog("0. " + j.message);
     j = await api(`/api/block/${B}/suspend`, "POST");
@@ -287,7 +322,49 @@ $("#btn-demo").onclick = async () => {
     r = await api("/api/block/3/write", "POST", { data: "POST-DISCONNECT-WRITE" });
     r = await api("/api/block/3");
     slog(`12. 断开后改写块 3 再读 → "${r.text}" ✔ 数据盘仍可读写`);
-    slog("=== 演示完成 ===");
+    slog("=== 演示一完成 ===");
+  } catch (e) {
+    slog("✘ 演示异常: " + e);
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+};
+
+$("#btn-demo-zero").onclick = async () => {
+  const btn = $("#btn-demo-zero");
+  btn.disabled = true;
+  try {
+    const st0 = await api("/api/status");
+    const Z0 = Math.max(0, st0.block_count - 56), Z1 = Z0 + 7, ZW = Z0 + 5;
+    slog("=== 演示二(清零)开始 ===");
+    let j = await api("/api/reset", "POST");
+    slog("0. " + j.message);
+    j = await api("/api/backfill/start", "POST");
+    slog("1. 启动后台回填 → " + j.message);
+    j = await api("/api/zero", "POST", { start: Z0, end: Z1 });
+    slog(`2. 清零块 [${Z0}, ${Z1}] → ${j.message}`);
+    let r = await api(`/api/block/${Z0 + 1}`);
+    slog(`3. 读清零块 ${Z0 + 1} → 来源=${r.source}(全零 ${r.size}B) ✔`);
+    const payload = `REWRITE-AFTER-ZERO @ ${new Date().toLocaleTimeString()}`;
+    r = await api(`/api/block/${ZW}/write`, "POST", { data: payload });
+    slog(`4. 清零后重写块 ${ZW} → HTTP ${r._status} ✔(重叠时以最后提交的操作为准)`);
+    r = await api(`/api/block/${ZW}`);
+    slog(`5. 读块 ${ZW} → 来源=${r.source}/${r.origin} 内容="${r.text}" ✔`);
+    slog("6. 等待回填完成(清零块计入进度,后台跳过清零块,在途不写回)...");
+    const done = await waitUntil(st => st.missing === 0, 60000);
+    if (!done) { slog("✘ 等待回填超时"); return; }
+    const st = await api("/api/status");
+    slog(`   已落盘 ${st.present} + 已清零 ${st.zeroed} = ${st.present + st.zeroed}/${st.block_count},进度 ${st.progress}%,在途丢弃 ${st.stats.zero_dropped}`);
+    r = await api(`/api/block/${Z0 + 1}`);
+    slog(`7. 回填后清零块 ${Z0 + 1} 仍是全零 → 来源=${r.source} ✔(回填未写回)`);
+    r = await api("/api/disconnect", "POST");
+    slog(`8. 断开备份 → HTTP ${r._status}: ${r.message} ✔`);
+    r = await api(`/api/block/${Z0 + 1}`);
+    slog(`9. 断开后读清零块 ${Z0 + 1} → 来源=${r.source}(全零) ✔`);
+    r = await api(`/api/block/${ZW}`);
+    slog(`10. 断开后读重写块 ${ZW} → "${r.text}" ✔`);
+    slog("=== 演示二完成 ===");
   } catch (e) {
     slog("✘ 演示异常: " + e);
   } finally {
